@@ -19,6 +19,7 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torch.distributions.normal import Normal
 import torch.distributions
+import argparse
 
 from vime import VIME
 
@@ -107,6 +108,7 @@ class KL():
         self.update_every = 1
         self.update_after = 1000
         self.render = True
+        self.default_states_dim = default_states_dim
 
         self.policy_net = PolicyNet(states_dim,action_space.shape[0]).to(device)
         self.policy_net_target = PolicyNet(states_dim,action_space.shape[0]).to(device)
@@ -124,6 +126,10 @@ class KL():
         self.value_optim = optim.Adam(self.value_net.parameters(), lr= self.learning_rate)
 
         for param in self.value_net_target.parameters():
+            param.requires_grad = False
+        for param in self.policy_net_target.parameters():
+            param.requires_grad = False
+        for param in self.default_policy_net_target.parameters():
             param.requires_grad = False
         self.replay_buffer = ReplayMemory(self.memory_capacity)
 
@@ -147,17 +153,15 @@ class KL():
             reward_batch = torch.cat(batch.reward)
 
             mean, std = self.policy_net(state_batch)
-            default_mean, default_std = self.default_policy_net(state_batch[:,:78])
-            default_mean_target, default_std_target = self.default_policy_net_target(state_batch[:,:78])
+            default_mean, default_std = self.default_policy_net(state_batch[:,:self.default_states_dim])
+            default_mean_target, default_std_target = self.default_policy_net_target(state_batch[:,:self.default_states_dim])
             pi_distribution = Normal(mean, std)
             pi_zero_distribution = Normal(default_mean, default_std)
             pi_zero_distribution_target = Normal(default_mean_target, default_std_target)
             
             next_mean, next_std = self.policy_net(next_state_batch)
-            #next_mean.detach_()
-            #next_std.detach_()
-            next_default_mean, next_default_std = self.default_policy_net(next_state_batch[:,:78])
-            next_default_mean_target, next_default_std_target = self.default_policy_net_target(next_state_batch[:,:78])
+            next_default_mean, next_default_std = self.default_policy_net(next_state_batch[:,:self.default_states_dim])
+            next_default_mean_target, next_default_std_target = self.default_policy_net_target(next_state_batch[:,:self.default_states_dim])
             next_pi_distribution = Normal(next_mean, next_std)
             next_pi_zero_distribution = Normal(next_default_mean, next_default_std)
             next_pi_zero_distribution_target = Normal(next_default_mean_target, next_default_std_target)
@@ -175,10 +179,9 @@ class KL():
                 target_action = next_pi_distribution_target.sample()
                 target_action = torch.max(torch.min(target_action, torch.tensor(self.action_space.maximum, dtype=torch.float32).to(device)), torch.tensor(self.action_space.minimum, dtype=torch.float32).to(device))
                 value_target = self.value_net_target(next_state_batch, target_action)
-                td_target = reward_batch + self.gamma * (1 - done_batch) * (value_target - self.alpha * next_kl_div_term_target.detach())#- self.alpha * kl_div_term_target.detach() 
+                td_target = reward_batch + self.gamma * (1 - done_batch) * (value_target - self.alpha * next_kl_div_term_target.detach()) - self.alpha * kl_div_term_target.detach() 
             
             self.policy_optim.zero_grad()
-            #action sampling from policy
             action = pi_distribution.rsample()
             value = self.value_net_target(state_batch, action)
             policy_loss = (self.alpha * (kl_div_term_target + next_kl_div_term_target) - value).mean()
@@ -214,17 +217,17 @@ class KL():
 def state_preprocessing(state):
     return torch.tensor(state.copy(), dtype = torch.float32).unsqueeze(0).to(device)
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--test', action = 'store_true')
+args = parser.parse_args()
+
 #env = gym.make('FetchReach-v1')
-env = suite.load(domain_name = 'quadruped', task_name = 'fetch', environment_kwargs = {'flat_observation' : True})#, task_kwargs = {'time_limit' : 60})
-"""time_step = env.reset()
-print(state_preprocessing(time_step.observation['observations']))"""
+env = suite.load(domain_name = 'quadruped', task_name = 'fetch', environment_kwargs = {'flat_observation' : True})#, task_kwargs = {'time_limit' : 40})
 #env.env.reward_type = 'dense'
 #env = gym.wrappers.filter_observation.FilterObservation(env, filter_keys=['observation', 'desired_goal'])
 #env = gym.wrappers.flatten_observation.FlattenObservation(env)
 agent = KL(90, 78, env.action_spec())
-#agent.policy_net.load_state_dict(torch.load('./pnet.pth'))
-#agent.value_net.load_state_dict(torch.load('./vnet.pth'))
-vime = VIME(90, env.action_spec().shape[0], device = device, hidden_layer_size = 256)
+#vime = VIME(90, env.action_spec().shape[0], device = device, hidden_layer_size = 256)
 
 scores, episodes = [], []
 score_avg = 0
@@ -233,8 +236,11 @@ def policy_by_agent(time_step):
     torch_action =  agent.get_action(state_preprocessing(time_step.observation['observations']))
     return torch_action.squeeze(0).cpu().detach().numpy()
 
-#viewer.launch(env, policy=policy_by_agent)
-#exit(0)
+if args.test:
+    agent.policy_net.load_state_dict(torch.load('./pnet.pth'))
+    viewer.launch(env, policy = policy_by_agent)
+    exit(0)
+
 initial_count = 0
 num_episodes = 1000
 for e in range(num_episodes):
@@ -242,7 +248,7 @@ for e in range(num_episodes):
     score = 0
     qloss_list, ploss_list = [], []
     time_step = env.reset()
-    o = time_step.observation['observations']
+    #o = time_step.observation['observations']
     state = state_preprocessing(time_step.observation['observations'])
 
     for c in count():
@@ -255,22 +261,22 @@ for e in range(num_episodes):
         
         a = action.squeeze(0).cpu().detach().numpy()
         time_step = env.step(a)
-        #print(time_step)
-        n_o = time_step.observation['observations']
+        
+        #n_o = time_step.observation['observations']
         next_state = state_preprocessing(time_step.observation['observations'])
         r = time_step.reward
-        done = time_step.discount if time_step.step_type == 1 else 0.0
+        done = 1.0 if time_step.step_type == 2 else 0.0
         score += r
         done = torch.tensor([[done]]).to(device)
 
-        info_gain, log_likelihood = vime.calc_info_gain(o,a,n_o)
-        vime.memorize_episodic_info_gains(info_gain)
-        r = vime.calc_curiosity_reward(r, info_gain)
+        #info_gain, log_likelihood = vime.calc_info_gain(o,a,n_o)
+        #vime.memorize_episodic_info_gains(info_gain)
+        #r = vime.calc_curiosity_reward(r, info_gain)
         reward = torch.tensor([[r]], dtype=torch.float32).to(device)
 
         agent.replay_buffer.push(state, action, next_state, reward, done)
         state = next_state
-        o = n_o
+        #o = n_o
         
         if c % agent.update_every == 0:
             qloss, ploss = agent.train_model()
@@ -280,18 +286,15 @@ for e in range(num_episodes):
                 ploss_list.append(ploss)
 
         if time_step.step_type == 2:
-            #score_avg = 0.9 * score_avg + 0.1 * score if score_avg != 0 else score
             print("episode : {:3d} | end at : {:3d} steps | score : {:3.3f} | q_loss = {:3.3f} | p_loss = {:.3f} ".format(e, c, score, np.mean(qloss_list), np.mean(ploss_list)))
-            #if score_avg > 900:
-            #    sys.exit()
             break
-    for _ in range(100):
-        transitions = agent.replay_buffer.sample(agent.batch_size)
-        batch = Transition(*zip(*transitions))
-        next_state_batch = torch.cat(batch.next_state)
-        state_batch = torch.cat(batch.state)
-        action_batch = torch.cat(batch.action)
-        elbo = vime.update_posterior(state_batch, action_batch, next_state_batch)
+    #for _ in range(100):
+    #    transitions = agent.replay_buffer.sample(agent.batch_size)
+    #    batch = Transition(*zip(*transitions))
+    #    next_state_batch = torch.cat(batch.next_state)
+    #    state_batch = torch.cat(batch.state)
+    #    action_batch = torch.cat(batch.action)
+    #    elbo = vime.update_posterior(state_batch, action_batch, next_state_batch)
     torch.save(agent.policy_net.state_dict(), './pnet.pth')
     torch.save(agent.value_net.state_dict(), './vnet.pth')
 env.close()
